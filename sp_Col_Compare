@@ -1,0 +1,254 @@
+
+
+-- =============================================
+-- Author:		<Alicia Loughnane>
+-- Create date: <7/5/2018>
+-- Purpose:		<Compare Column data between two tables>
+-- Description: This will work on any two tables with the following conditions:
+--				Both tables have a single column, primary key with matching column names
+--				Any columns with different names will not be compared
+-- =============================================
+
+
+USE TSQL2012
+GO
+
+
+ALTER PROCEDURE Col_Compare
+	
+AS
+BEGIN
+	-- SET NOCOUNT ON added to prevent extra result sets from
+	-- interfering with SELECT statements.
+	SET NOCOUNT ON;
+--Change table names here:
+
+	DECLARE  @Table1_Name VARCHAR(25) = 'OriginalData'
+			,@Table2_Name VARCHAR(25) = 'ReplacementData'
+			,@BigTable BIT = 1 --Set to 1 ONLY if there are a lot of columns to allow for over 8000 characters.
+			
+--*********************************************************	
+	--These Variables should be left alone
+
+			,@T1Col_Count INT
+			,@T2Col_Count INT
+			,@MatchedCol_Count INT
+			,@UnMatchedT1_Count INT
+			,@UnMatchedT2_Count INT
+			,@T_PK VARCHAR(MAX) = ' '
+			,@ColNmGen VARCHAR(Max) =''
+			,@WhereStmt VARCHAR(Max) =''
+			,@SelStmt VARCHAR(Max) = ''
+			
+  IF ISNULL(@Table1_name,'') = '' OR ISNULL(@Table2_Name,'') = ''
+	BEGIN
+		RAISERROR('Table name(s) missing. There should be two named tables to generate the output',16,1)
+		RETURN -1 --Failure. Reason: Cannot compare two tables if they are not identified.
+	END
+  
+  --If the sp LongPrint Procedure is not available and @BigTable is set to 1, this will create it. (Created by Tim Wiseman http://www.sqlservercentral.com/scripts/Print/63240/)
+    
+		IF NOT EXISTS(SELECT * FROM sys.objects WHERE name ='LongPrint')
+		
+			EXEC ('CREATE PROCEDURE [dbo].[LongPrint] --Example: EXEC LongPrint @String = This string exists to test the system (add single quotes)
+					@String NVARCHAR(MAX)
+					AS 
+					BEGIN
+						-- EXAMPLE exec LongPrint @string
+						/* This procedure is designed to overcome the limitation
+							in the SQL print command that causes it to truncate strings
+							longer than 8000 characters (4000 for nvarchar).
+
+							It will print the text passed to it in substrings smaller than 4000
+							characters.  If there are carriage returns (CRs) or new lines (NLs in the text),
+							it will break up the substrings at the carriage returns and the
+							printed version will exactly reflect the string passed.
+
+							If there are insufficient line breaks in the text, it will
+							print it out in blocks of 4000 characters with an extra carriage
+							return at that point.
+
+							If it is passed a null value, it will do virtually nothing.
+
+							NOTE: This is substantially slower than a simple print, so should only be used
+							when actually needed.
+							*/		  		
+	
+						DECLARE  @CurrentEnd BIGINT, --track the length of the next substring 
+									@offset tinyint	 --track the amount of offset needed 
+
+						set @string = replace(  replace(@string, char(13) + char(10), char(10))   , char(13), char(10))
+
+							WHILE LEN(@String) > 1
+
+							BEGIN --Begin While loop
+								IF CHARINDEX(CHAR(10), @String) between 1 AND 4000
+									BEGIN
+											SET @CurrentEnd =  CHARINDEX(char(10), @String) -1
+											SET @offset = 2
+									END
+								ELSE
+									BEGIN
+											SET @CurrentEnd = 4000
+											SET @offset = 1
+									END   
+   
+   							PRINT SUBSTRING(@String, 1, @CurrentEnd) 
+                                                 
+							SET @string = SUBSTRING(@String, @CurrentEnd+@offset, 1073741822)   
+              
+							END --End While loop
+					END')
+	
+	--Clean Up
+
+	IF OBJECT_ID('dbo.#Table1_Col') IS NOT NULL
+	DROP TABLE #Table1_Col
+
+	IF OBJECT_ID('dbo.#Table2_Col') IS NOT NULL
+	DROP TABLE #Table2_Col
+
+	IF OBJECT_ID('dbo.#Table2_Col') IS NOT NULL
+	DROP TABLE #Tables_PK
+
+	IF OBJECT_ID('dbo.#TableColumns') IS NOT NULL
+	DROP TABLE #TableColumns
+
+	IF OBJECT_ID('dbo.#Col_Results') IS NOT NULL
+	DROP TABLE #Col_Results
+
+	IF OBJECT_ID('dbo.#ColNmGenerator') IS NOT NULL
+	DROP TABLE #ColNmGenerator
+	
+	
+	--Get the Keys for the tables
+	
+	SELECT kcu.table_name as Tablename
+		  ,kcu.column_name as PKCol
+		 
+	INTO #Tables_PK
+	FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+	INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS kcu
+		ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND
+		   tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND 
+		   kcu.table_name IN (@Table1_Name, @Table2_Name)
+	ORDER BY kcu.TABLE_NAME, kcu.ORDINAL_POSITION;
+	
+	SELECT  @T_PK = @T_PK + ' [' + pk.Tablename + '].[' +  pk.PKCol +'] = '
+	FROM    #Tables_PK pk 
+
+	--Testing statements
+	--SELECT * FROM #Tables_PK
+	--SELECT LEFT(@T_PK,LEN(@T_PK)-2) AS Keybuilder
+	
+	
+	-- Now pull the schema names to generate a script that looks for changes in the data
+
+	SELECT	OBJECT_SCHEMA_NAME(t.[object_id],DB_ID()) AS [Schema]
+		,t.[name] AS [table_name]
+		,ac.[name] AS [column_name]   
+        ,ty.[name] AS [system_data_type]
+		,ac.[max_length]  
+        ,ac.[precision]
+		,ac.[scale]
+		,ac.[is_nullable]
+		,ac.[is_ansi_padded] 
+	INTO #TableColumns 
+	FROM sys.[tables] AS t   
+	INNER JOIN sys.[all_columns] ac 
+		ON t.[object_id] = ac.[object_id]  
+	 INNER JOIN sys.[types] ty 
+		ON ac.[system_type_id] = ty.[system_type_id] 
+		AND ac.[user_type_id] = ty.[user_type_id]   
+	WHERE t.[is_ms_shipped] = 0 
+	AND t.[name] IN (@Table1_Name, @Table2_Name) 
+	ORDER BY t.[name], ac.[column_id]
+
+	--SELECT * FROM #TableColumns
+	
+	--Populate to two tables for comparison
+	SELECT	[Schema]
+			,[table_name]
+			,[column_name]
+			,[system_data_type]
+			,[max_length]
+	INTO #Table1
+	FROM #TableColumns
+	WHERE [table_name] = @Table1_Name
+
+	SELECT	[Schema]
+			,[table_name]
+			,[column_name]
+			,[system_data_type]
+			,[max_length]
+	INTO #Table2
+	FROM #TableColumns
+	WHERE [table_name] = @Table2_Name
+
+	SELECT 
+		   COALESCE(t1.column_name,t2.column_name) as ColName 
+		  ,CASE WHEN t1.column_name IS NULL THEN @Table2_Name + 'Table only'
+				WHEN t2.column_name IS NULL THEN @Table1_Name +' Table only' 
+				ELSE 'Columns Match' END AS Match_Status
+		  ,CASE WHEN t1.column_name = t2.column_Name 
+					AND t1.system_data_type <> t2.system_data_type 
+				THEN 'Data Type mismatch: ' + t1.system_data_type + '/' + t2.system_data_type
+				ELSE '' END AS DataTypes
+		  ,CASE WHEN t1.column_name = t2.column_Name 
+					AND t1.max_length <> t2.max_length 
+				THEN 'Column Length mismatch: ' + CAST (t1.max_length AS VARCHAR(30)) + '/' + CAST(t2.max_length AS VARCHAR(30))
+				ELSE '' END AS Match_Length
+	INTO #Col_Results
+	FROM #Table1 t1
+	FULL OUTER JOIN #Table2 t2
+		ON t1.column_name = t2.column_name
+	ORDER BY COALESCE(t1.column_name,t2.column_name)
+
+	--Show Results from Column matching
+	SELECT * FROM #Col_Results
+
+	--Build a temp table for data results
+	
+	SELECT  @Table1_Name as T1
+		   ,@Table2_Name as T2
+		   ,cr.ColName
+	INTO #ColNmGenerator
+	FROM #Col_Results cr
+	WHERE cr.Match_Status = 'Columns Match'
+	
+	-- Build the Row Data into an Select statement
+		
+		SELECT  @ColNmGen =  @ColNmGen + '[' + T1 + '].[' + cng.ColName + '] AS ' + cng.ColName + '_Table1 '+ CHAR(10)
+				+', [' + T2 + '].['+ cng.ColName + '] AS ' + cng.ColName + '_Table2, '
+		FROM    #ColNmGenerator cng
+		
+	--SELECT  LEFT(@ColNmGen,LEN(@ColNmGen)-2) AS Cols
+
+	-- Build the Where Statement
+	 
+		SELECT  @WhereStmt = @WhereStmt + CHAR(10)+'[' + T1 + '].[' + cng.ColName + '] <> [' + T2 + '].[' + cng.ColName + '] OR '--+ CHAR(10)
+		FROM    #ColNmGenerator cng
+		
+	--SELECT  LEFT(@WhereStmt,LEN(@WhereStmt)-2) AS Whr
+	--Find the Common, Primary Key
+	--*****************************************************************************************************************************************************************
+
+	-- Build the full Select Statment
+	
+	SET @SelStmt = 'SELECT ' + LEFT(@ColNmGen,LEN(@ColNmGen)-2) 
+		+ ' FROM ' + @Table1_Name + CHAR(10)
+		+ ' JOIN ' + @Table2_Name + ' ON ' + LEFT(@T_PK,LEN(@T_PK)-2) + CHAR(10)
+		+ 'WHERE ' + LEFT(@WhereStmt,LEN(@WhereStmt)-2) 
+
+
+--select @@OPTIONS&512  --Used to test NOCOUNT
+
+	IF @BigTable = 1
+		EXEC LongPrint @SelStmt
+	IF @BigTable = 0
+		PRINT @SelStmt;
+		
+  
+
+END
+GO
